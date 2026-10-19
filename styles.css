@@ -263,3 +263,64 @@ tr:hover td{background:#f9fafc;}
   margin-top:16px;background:var(--navy);color:#fff;border:none;border-radius:8px;
   padding:9px 18px;font-size:12.5px;font-weight:600;cursor:pointer;
 }
+
+
+/* ---------- ALERTA DE RIESGO / PLAN DE ABASTECIMIENTO ---------- */
+.nav-badge{margin-left:auto;background:var(--red);color:#fff;font-size:10.5px;font-weight:800;border-radius:10px;padding:2px 7px;line-height:1.3;}
+.alert-btn{margin-top:8px;border:none;background:#9c2a23;color:#fff;border-radius:7px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer;}
+.alert.warn .alert-btn{background:#8a5b12;}
+.alert-btn:hover{filter:brightness(1.1);}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:16px;}
+@media(max-width:1100px){.grid4{grid-template-columns:repeat(2,1fr);}}
+.plan-controls{display:flex;flex-wrap:wrap;gap:14px;}
+.plan-controls label{display:flex;flex-direction:column;gap:5px;font-size:11.5px;font-weight:600;color:var(--sub);text-transform:uppercase;letter-spacing:.3px;}
+.plan-controls input,.plan-controls select{padding:8px 12px;border:1px solid #dde1ea;border-radius:8px;font-size:13px;background:#fff;color:var(--ink);outline:none;min-width:150px;text-transform:none;letter-spacing:0;font-weight:500;}
+.plan-controls input:focus,.plan-controls select:focus{border-color:var(--navy);}
+.plan-toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px;}
+.plan-tabs{display:flex;gap:4px;background:var(--gray-bg);padding:4px;border-radius:9px;}
+.plan-tabs button{border:none;background:transparent;padding:7px 14px;border-radius:7px;font-size:12.8px;font-weight:600;color:var(--sub);cursor:pointer;}
+.plan-tabs button.active{background:#fff;color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.12);}
+.plan-actions{display:flex;gap:8px;}
+.btn{border:1px solid #dde1ea;background:#fff;color:var(--ink);border-radius:8px;padding:8px 14px;font-size:12.8px;font-weight:600;cursor:pointer;}
+.btn.primary{background:var(--navy);color:#fff;border-color:var(--navy);}
+.btn:hover{filter:brightness(.96);}
+.count-pill-row{display:flex;justify-content:flex-end;margin-bottom:8px;}
+.plan-eess{border:1px solid #e7eaf1;border-radius:10px;margin-bottom:14px;overflow:hidden;}
+.plan-eess-head{display:flex;align-items:center;gap:16px;padding:10px 14px;background:#f6f8fc;border-bottom:1px solid #e7eaf1;flex-wrap:wrap;}
+.plan-eess-head>div:first-child{flex:1;min-width:200px;}
+.plan-eess-head b{display:block;font-size:13.5px;}
+.plan-eess-head span{font-size:11.5px;color:var(--sub);}
+.plan-prog{font-size:15px;font-weight:800;}
+.plan-count{font-size:12px;color:var(--sub);font-weight:600;}
+.plan-warn{background:var(--orange-bg);color:#8a5b12;font-size:12px;padding:7px 14px;border-bottom:1px solid #f3ddb0;}
+.plan-prod-head td{background:#f6f8fc;border-top:2px solid #e3e7f0;}
+.muted{color:var(--sub);font-size:11.5px;}
+.plan-print-head{display:none;}
+
+/* ---------- IMPRESIÓN ---------- */
+@media print{
+  @page{size:A4 landscape;margin:12mm;}
+  body{display:block;background:#fff;}
+  .sidebar,.topbar,.no-print,#loadingPanel,#errorPanel{display:none !important;}
+  .main,.content{padding:0;display:block;}
+  .view{display:none !important;}
+  #view-plan{display:block !important;animation:none;}
+  #view-plan .card{border:none;padding:0;}
+  .plan-print-head{display:block;margin-bottom:10px;border-bottom:2px solid #000;padding-bottom:6px;}
+  .plan-print-head h2{margin:0 0 4px;font-size:16px;}
+  .plan-print-head p{margin:0;font-size:11px;color:#333;}
+  body.print-eess #planPaneProd{display:none !important;}
+  body.print-prod #planPaneEess{display:none !important;}
+  table{font-size:10.5px;}
+  th,td{padding:4px 6px;white-space:normal;}
+  th{cursor:default;}
+  tr:hover td{background:none;}
+  thead{display:table-header-group;}
+  tr{break-inside:avoid;}
+  .plan-eess{border-radius:0;margin-bottom:10px;overflow:visible;}
+  .plan-eess-head{break-after:avoid;}
+  .plan-prod-head{break-after:avoid;}
+  .chip{padding:0;background:none !important;}
+  .chip .dot{display:none;}
+  *{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
+}

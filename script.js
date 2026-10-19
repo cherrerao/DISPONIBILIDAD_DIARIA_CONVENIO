@@ -100,59 +100,87 @@ function isValidForTab(tabName, csv){
   return validator(headerSignature(csv));
 }
 
+// ── Conexión robusta: timeouts, descarga única del libro como respaldo y caché local ──
+const FETCH_TIMEOUT_MS = 9000;
+const CACHE_KEY = 'dispo_convenio_cache_v1';
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let _csvBroken = false; // si una hoja falla por CSV, las demás van directo al libro completo
+
+async function fetchWithTimeout(url, opts = {}, ms = FETCH_TIMEOUT_MS) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try { return await fetch(url, { ...opts, signal: ctrl.signal, cache: 'no-store' }); }
+  finally { clearTimeout(t); }
+}
+
 async function fetchSheetCSV(tab) {
-  const directUrl = `https://docs.google.com/spreadsheets/d/${FILE_ID}/export?format=csv&sheet=${encodeURIComponent(tab)}`;
-  const gvizUrl   = `https://docs.google.com/spreadsheets/d/${FILE_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}`;
-  try {
-    const res = await fetch(directUrl, { redirect: 'follow' });
-    if (res.ok) { const csv = await res.text(); if (csv && csv.length > 5 && !csv.includes('<html') && isValidForTab(tab, csv)) return csv; }
-  } catch(e) {}
-  const proxies = [
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(gvizUrl)}`,
+  const enc = encodeURIComponent(tab);
+  const gvizUrl   = `https://docs.google.com/spreadsheets/d/${FILE_ID}/gviz/tq?tqx=out:csv&sheet=${enc}`;
+  const directUrl = `https://docs.google.com/spreadsheets/d/${FILE_ID}/export?format=csv&sheet=${enc}`;
+  const sources = [
+    gvizUrl,
+    directUrl,
     `https://corsproxy.io/?${encodeURIComponent(gvizUrl)}`,
-    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(gvizUrl)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(gvizUrl)}`,
   ];
-  for (const proxy of proxies) {
+  for (const url of sources) {
     try {
-      const res = await fetch(proxy);
-      if (res.ok) { const csv = await res.text(); if (csv && csv.length > 5 && !csv.includes('<html') && isValidForTab(tab, csv)) return csv; }
-    } catch(e) { continue; }
+      const res = await fetchWithTimeout(url, { redirect: 'follow' });
+      if (!res.ok) continue;
+      const csv = await res.text();
+      if (csv && csv.length > 5 && !csv.includes('<html') && isValidForTab(tab, csv)) return csv;
+    } catch (e) { /* siguiente fuente */ }
   }
-  return null; // señal para intentar el respaldo binario
+  return null; // señal para usar el respaldo del libro completo
+}
+
+// Un xlsx real empieza con "PK". Drive a veces devuelve una página HTML de confirmación
+// (más de 2 KB) que antes se aceptaba como si fuera el archivo → fallos intermitentes.
+function looksLikeXlsx(buf) {
+  if (!buf || buf.byteLength < 2000) return false;
+  const b = new Uint8Array(buf, 0, 2);
+  return b[0] === 0x50 && b[1] === 0x4B;
 }
 
 async function fetchXlsxBinary(fileId) {
-  const directUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
-  try {
-    const res = await fetch(directUrl);
-    if (res.ok) { const buf = await res.arrayBuffer(); if (buf.byteLength > 2000) return buf; }
-  } catch(e) {}
-  const proxies = [
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`,
-    `https://corsproxy.io/?${encodeURIComponent(directUrl)}`,
-    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(directUrl)}`,
+  const urls = [
+    `https://docs.google.com/spreadsheets/d/${fileId}/export?format=xlsx`,
+    `https://drive.google.com/uc?export=download&confirm=t&id=${fileId}`,
+    `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`,
   ];
-  for (const proxy of proxies) {
+  const sources = [...urls];
+  urls.forEach(u => {
+    sources.push(`https://corsproxy.io/?${encodeURIComponent(u)}`);
+    sources.push(`https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`);
+  });
+  for (const url of sources) {
     try {
-      const res = await fetch(proxy);
-      if (res.ok) { const buf = await res.arrayBuffer(); if (buf.byteLength > 2000) return buf; }
-    } catch(e) { continue; }
+      const res = await fetchWithTimeout(url, { redirect: 'follow' }, 25000);
+      if (!res.ok) continue;
+      const buf = await res.arrayBuffer();
+      if (looksLikeXlsx(buf)) return buf;
+    } catch (e) { /* siguiente fuente */ }
   }
   throw new Error('No se pudo conectar con Google Drive. Verifica que el archivo esté compartido como "Cualquiera con el enlace puede ver".');
 }
 
-let _wbCache = null;
-async function getWorkbookCached() {
-  if (_wbCache) return _wbCache;
-  const buf = await fetchXlsxBinary(FILE_ID);
-  _wbCache = XLSX.read(buf, {type:'array'});
-  return _wbCache;
+// Promesa compartida: las 4 hojas esperan UNA sola descarga (antes se descargaba 4 veces en paralelo)
+let _wbPromise = null;
+function getWorkbookCached() {
+  if (!_wbPromise) {
+    _wbPromise = fetchXlsxBinary(FILE_ID)
+      .then(buf => XLSX.read(buf, { type: 'array' }))
+      .catch(e => { _wbPromise = null; throw e; });
+  }
+  return _wbPromise;
 }
 
 async function fetchTabCSV(tab) {
-  const csv = await fetchSheetCSV(tab);
-  if (csv) return csv;
-  // Respaldo: se lee el binario completo y se extrae la hoja exacta por nombre (SheetJS)
+  if (!_csvBroken) {
+    const csv = await fetchSheetCSV(tab);
+    if (csv) return csv;
+    _csvBroken = true;
+  }
   const wb = await getWorkbookCached();
   const wsName = wb.SheetNames.find(n => n.toLowerCase() === tab.toLowerCase())
     || wb.SheetNames.find(n => n.toLowerCase().startsWith(tab.toLowerCase()))
@@ -163,14 +191,24 @@ async function fetchTabCSV(tab) {
   return csv2;
 }
 
-async function fetchAllData() {
+function saveCache(csvs) {
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), csvs })); } catch (e) {}
+}
+function loadCache() {
+  try { const j = localStorage.getItem(CACHE_KEY); return j ? JSON.parse(j) : null; } catch (e) { return null; }
+}
+
+async function fetchAllCsv() {
   const [detalleCsv, redCsv, estabCsv, promedioCsv] = await Promise.all([
     fetchTabCSV(TABS.detalle),
     fetchTabCSV(TABS.red),
     fetchTabCSV(TABS.estab),
     fetchTabCSV(TABS.promedio),
   ]);
+  return { detalleCsv, redCsv, estabCsv, promedioCsv };
+}
 
+function parseAllCsv({ detalleCsv, redCsv, estabCsv, promedioCsv }) {
   const rawRows = parseCSVText(detalleCsv);
 
   const redRows = parseGenericCSV(redCsv).map(o => ({
@@ -194,6 +232,13 @@ async function fetchAllData() {
   const promedioDisponibilidad = promedioRows.length ? numFrom(promedioRows[0], promedioKey) : null;
 
   return { rawRows, redRows, estRows, promedioDisponibilidad };
+}
+
+async function fetchAllData() {
+  const csvs = await fetchAllCsv();
+  const parsed = parseAllCsv(csvs);
+  saveCache(csvs); // solo se guarda si todo se descargó y se interpretó bien
+  return parsed;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -268,37 +313,61 @@ function setLiveBadge(state, text){
   b.innerHTML = `<span class="foot-dot" style="background:${fg}"></span> ${text}`;
 }
 
+function applyData({ rawRows, redRows, estRows, promedioDisponibilidad }) {
+  if (!rawRows.length) throw new Error('La hoja de detalle no devolvió registros.');
+  if (!redRows.length) throw new Error('La hoja de resumen por red no devolvió registros.');
+  if (!estRows.length) throw new Error('La hoja de resumen por establecimiento no devolvió registros.');
+  const agg = buildAggregates(rawRows, redRows, estRows);
+  RAW = rawRows;
+  RED = agg.RED; EST = agg.EST; PROD = agg.PROD; DETAIL_RAW = agg.DETAIL_RAW;
+  computeGlobals(promedioDisponibilidad);
+  document.getElementById('loadingPanel').style.display = 'none';
+  document.getElementById('dashViews').style.display = 'block';
+  render();
+}
+
+let _loading = false;
 async function loadAndRender(){
+  if (_loading) return;
+  _loading = true;
   document.getElementById('loadingPanel').style.display = 'flex';
   document.getElementById('errorPanel').style.display = 'none';
   document.getElementById('dashViews').style.display = 'none';
   setLiveBadge('loading', 'CONECTANDO…');
-  _wbCache = null; // limpia caché del binario en cada actualización
+  _wbPromise = null; _csvBroken = false; // limpia el estado de conexión en cada actualización
   try {
-    const { rawRows, redRows, estRows, promedioDisponibilidad } = await fetchAllData();
-    if (!rawRows.length) throw new Error('La hoja de detalle no devolvió registros.');
-    if (!redRows.length) throw new Error('La hoja de resumen por red no devolvió registros.');
-    if (!estRows.length) throw new Error('La hoja de resumen por establecimiento no devolvió registros.');
-    const agg = buildAggregates(rawRows, redRows, estRows);
-    RED = agg.RED; EST = agg.EST; PROD = agg.PROD; DETAIL_RAW = agg.DETAIL_RAW;
-    computeGlobals(promedioDisponibilidad);
-
-    document.getElementById('loadingPanel').style.display = 'none';
-    document.getElementById('dashViews').style.display = 'block';
+    let parsed = null, lastErr = null;
+    for (let attempt = 0; attempt < 2 && !parsed; attempt++) {
+      try { parsed = await fetchAllData(); }
+      catch (e) { lastErr = e; _wbPromise = null; _csvBroken = false; if (attempt === 0) await sleep(1500); }
+    }
+    if (!parsed) throw lastErr;
+    applyData(parsed);
     setLiveBadge('ok', 'EN VIVO');
     document.getElementById('lastUpdated').textContent = 'Actualizado ' + new Date().toLocaleTimeString('es-PE',{hour:'2-digit',minute:'2-digit'});
-    render();
   } catch(err){
+    // Sin conexión: se muestra la última copia buena guardada en este navegador
+    const cached = loadCache();
+    if (cached) {
+      try {
+        applyData(parseAllCsv(cached.csvs));
+        setLiveBadge('err', 'DATOS EN CACHÉ');
+        document.getElementById('lastUpdated').textContent = 'Sin conexión · datos del ' + new Date(cached.ts).toLocaleString('es-PE',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) + ' · pulsa ↺ para reintentar';
+        return;
+      } catch (e2) { /* si la caché tampoco sirve, se muestra el error */ }
+    }
     document.getElementById('loadingPanel').style.display = 'none';
     setLiveBadge('err', 'SIN CONEXIÓN');
     document.getElementById('errorPanel').style.display = 'block';
     document.getElementById('errorPanel').innerHTML = `
       <div class="error-panel">
         <p>No se pudieron cargar los datos</p>
-        <small>${err.message}</small>
+        <small>${err && err.message ? err.message : 'Error de conexión'}</small>
         <small>Verifica que el archivo esté compartido como "Cualquiera con el enlace puede ver".</small>
         <button onclick="loadAndRender()">↺ Reintentar</button>
       </div>`;
+  } finally {
+    _loading = false;
   }
 }
 document.getElementById('refreshBtn').addEventListener('click', loadAndRender);
@@ -338,6 +407,7 @@ const pageMeta = {
   estab:{title:'Por Establecimiento', desc:'Situación de stock por EESS, 47 establecimientos evaluados'},
   alertas:{title:'Ranking & Alertas', desc:'Establecimientos y medicamentos que requieren atención prioritaria'},
   producto:{title:'Por Producto', desc:'Disponibilidad agregada por medicamento, todas las redes'},
+  plan:{title:'Plan de abastecimiento', desc:'Productos y cantidades a distribuir por establecimiento para alcanzar la meta de disponibilidad'},
   detalle:{title:'Detalle', desc:'Registro completo de stock, consumo y disponibilidad por ítem'}
 };
 document.getElementById('nav').addEventListener('click', (e)=>{
@@ -738,7 +808,12 @@ function render(){
 
   renderDetTable();
 
+  renderRiskPanel();
+  populatePlanFilters();
+  renderPlan();
+
   if(!listenersBound){
+    bindPlan();
     document.getElementById('estabSearch').addEventListener('input', renderEstabTable);
     document.getElementById('estabRedFilter').addEventListener('change', renderEstabTable);
     document.getElementById('prodSearch').addEventListener('input', renderProdTable);
@@ -749,4 +824,227 @@ function render(){
     listenersBound = true;
   }
 }
+/* ============================================================
+   ALERTA DE RIESGO + PLAN DE ABASTECIMIENTO
+   ============================================================ */
+let RAW = [];
+const PLAN_STATE = { target: 95, months: 3, red: '', prio: 'desab', scope: 'below', tab: 'eess' };
+let PLAN = null;
+const CHIP_CLS = {'NORMOSTOCK':'normo','SOBRESTOCK':'sobre','SIN ROTACION':'sinrot','SUBSTOCK':'subst','DESABASTECIDO':'desab','SIN INFORMACION':'sininfo'};
+
+function goView(v){
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.view === v));
+  document.querySelectorAll('.view').forEach(vv => vv.classList.remove('active'));
+  document.getElementById('view-' + v).classList.add('active');
+  document.getElementById('pageTitle').textContent = pageMeta[v].title;
+  document.getElementById('pageDesc').textContent = pageMeta[v].desc;
+  window.scrollTo(0, 0);
+}
+
+/* ---------- Alerta de establecimientos en riesgo (Resumen + insignia del menú) ---------- */
+function renderRiskPanel(){
+  const crit = EST.filter(e => e.DISPONIBILIDAD <= 80).sort((a,b) => a.DISPONIBILIDAD - b.DISPONIBILIDAD);
+  const warn = EST.filter(e => e.DISPONIBILIDAD > 80 && e.DISPONIBILIDAD <= 90);
+  const box = document.getElementById('riskBox');
+  const badge = document.getElementById('navRiskBadge');
+  badge.textContent = crit.length;
+  badge.style.display = crit.length ? 'inline-block' : 'none';
+  if (!crit.length && !warn.length) { box.innerHTML = ''; return; }
+  const cls = crit.length ? 'crit' : 'warn';
+  const names = (crit.length ? crit : warn).slice(0, 5)
+    .map(e => `${e.est} (${fmt(e.DISPONIBILIDAD,1)}%)`).join(' · ');
+  const more = (crit.length ? crit.length : warn.length) > 5 ? ' …' : '';
+  box.innerHTML = `<div class="alert ${cls}">
+    <div class="alert-ico">${crit.length ? '🚨' : '⚠️'}</div>
+    <div>
+      <b>${crit.length} establecimiento(s) en riesgo crítico (≤80%) y ${warn.length} en alerta (80–90%)</b>
+      <span>Más bajos: ${names}${more}</span>
+      <button class="alert-btn" onclick="goView('plan')">Ver plan de abastecimiento →</button>
+    </div>
+  </div>`;
+}
+
+/* ---------- Cálculo del plan ---------- */
+function planRank(it){ return it.ind === 'DESABASTECIDO' ? 0 : 1; }
+
+function computePlan(){
+  const { target, months, red, prio, scope } = PLAN_STATE;
+  const byEst = {};
+  RAW.forEach(r => {
+    if (r.ind !== 'DESABASTECIDO' && r.ind !== 'SUBSTOCK') return;
+    const k = r.red + '||' + r.est;
+    (byEst[k] = byEst[k] || []).push(r);
+  });
+
+  const eess = [], prodMap = new Map();
+  let sumCur = 0, sumProj = 0, noCpaTotal = 0, unreachableCount = 0;
+
+  EST.forEach(e => {
+    const cur = e.DISPONIBILIDAD;
+    const T = e.TOTAL;
+    const D = e.DISPONIBLES || (e.NORMOSTOCK + e.SOBRESTOCK);
+    let proj = cur;
+    const inScope = T > 0 && (!red || e.red === red) && (scope === 'crit' ? (cur <= 80 && cur < target) : cur < target);
+
+    if (inScope) {
+      // ítems que faltan convertir a Normostock/Sobrestock para llegar a la meta
+      const need = Math.max(0, Math.ceil(target * T / 100 - 1e-9) - D);
+      const cand = []; let noCpa = 0;
+      (byEst[e.red + '||' + e.est] || []).forEach(r => {
+        if (!(r.cpa > 0)) { noCpa++; return; }          // sin consumo: no se puede proyectar
+        const goal = r.cpa * months;                     // stock objetivo = CPA × meses de cobertura
+        const qty = Math.ceil(goal - r.stk - 1e-9);      // cantidad a distribuir
+        if (qty <= 0) return;
+        cand.push({ codmed: r.codmed, med: r.med, ind: r.ind, stk: r.stk, cpa: r.cpa, disp: r.disp, qty, rel: qty / goal });
+      });
+      cand.sort((a, b) => prio === 'desab'
+        ? (planRank(a) - planRank(b)) || (a.rel - b.rel) || (b.cpa - a.cpa)
+        : (a.rel - b.rel) || (b.cpa - a.cpa));
+      const items = cand.slice(0, need);
+      const unreachable = cand.length < need;
+      proj = Math.min(100, cur + items.length / T * 100);
+      const units = items.reduce((s, i) => s + i.qty, 0);
+      eess.push({ red: e.red, est: e.est, cod: e.cod, cur, proj, need, items, units, unreachable, short: Math.max(0, need - cand.length), noCpa });
+      noCpaTotal += noCpa;
+      if (unreachable) unreachableCount++;
+      items.forEach(it => {
+        const key = it.codmed || it.med;
+        let p = prodMap.get(key);
+        if (!p) { p = { codmed: it.codmed, med: it.med, units: 0, list: [] }; prodMap.set(key, p); }
+        p.units += it.qty;
+        p.list.push({ red: e.red, est: e.est, ind: it.ind, qty: it.qty });
+      });
+    }
+    sumCur += cur; sumProj += proj;
+  });
+
+  eess.sort((a, b) => a.cur - b.cur);
+  const prods = [...prodMap.values()].sort((a, b) => b.list.length - a.list.length || b.units - a.units);
+  prods.forEach(p => p.list.sort((a, b) => b.qty - a.qty));
+  const n = EST.length || 1;
+  const globalProj = Math.min(100, globalDisponibilidad + (sumProj - sumCur) / n);
+  const itemsTotal = eess.reduce((s, e) => s + e.items.length, 0);
+  return { eess, prods, itemsTotal, globalProj, noCpaTotal, unreachableCount };
+}
+
+/* ---------- Render del plan ---------- */
+function renderPlan(){
+  if (!EST.length) return;
+  const P = PLAN_STATE;
+  PLAN = computePlan();
+  const hoy = new Date().toLocaleDateString('es-PE', { day: '2-digit', month: '2-digit', year: 'numeric' });
+
+  document.getElementById('planPrintHead').innerHTML =
+    `<h2>Plan de abastecimiento · DIRESA Callao – DEMID</h2>
+     <p>Meta de disponibilidad ${P.target}% · Cobertura objetivo ${P.months} meses${P.red ? ' · ' + P.red : ''} · Generado el ${hoy}<br>
+     ${PLAN.eess.length} EESS a abastecer · ${fmtInt(PLAN.itemsTotal)} ítems · Disponibilidad global ${fmt(globalDisponibilidad,1)}% → ${fmt(PLAN.globalProj,1)}% proyectada</p>`;
+
+  document.getElementById('planKpis').innerHTML = `
+    <div class="kpi"><div class="label">EESS a abastecer</div><div class="value">${PLAN.eess.length}</div><div class="sub">por debajo de la meta de ${P.target}%</div></div>
+    <div class="kpi"><div class="label">Ítems a abastecer</div><div class="value">${fmtInt(PLAN.itemsTotal)}</div><div class="sub">combinaciones producto × EESS</div></div>
+    <div class="kpi"><div class="label">Productos distintos</div><div class="value">${fmtInt(PLAN.prods.length)}</div><div class="sub">a distribuir en total</div></div>
+    <div class="kpi"><div class="label">Disponibilidad global proyectada</div><div class="value" style="color:${textColorForDisp(PLAN.globalProj)}">${fmt(PLAN.globalProj,1)}%</div><div class="sub">hoy ${fmt(globalDisponibilidad,1)}% (promedio entre ${EST.length} EESS)</div></div>`;
+
+  let notes = `Cantidad a distribuir = CPA × ${P.months} meses − stock actual (redondeado hacia arriba). Solo se consideran ítems Desabastecidos y Substock con consumo (CPA &gt; 0); los ítems Sin rotación se resuelven redistribuyendo stock entre EESS, no con nuevo abastecimiento. No se descuenta el stock del almacén central.`;
+  if (PLAN.unreachableCount) notes += ` <strong>${PLAN.unreachableCount} EESS no llegan a la meta</strong> solo con abastecimiento (faltan ítems con consumo); aparecen marcados.`;
+  if (PLAN.noCpaTotal) notes += ` ${fmtInt(PLAN.noCpaTotal)} ítems sin CPA no se pueden proyectar.`;
+  document.getElementById('planNotes').innerHTML = `<div class="alert warn no-print"><div class="alert-ico">ℹ️</div><div><b>Cómo se calcula el plan</b><span>${notes}</span></div></div>`;
+
+  // ----- Por establecimiento -----
+  const eessHtml = PLAN.eess.map(e => {
+    const rows = e.items.length ? e.items.map((it, i) => `
+      <tr><td>${i + 1}</td><td>${it.codmed}</td><td>${it.med}</td>
+      <td><span class="chip ${CHIP_CLS[it.ind]}"><span class="dot"></span>${IND_LABELS[it.ind]}</span></td>
+      <td>${fmtInt(it.stk)}</td><td>${fmt(it.cpa,1)}</td><td>${fmt(it.disp,1)}</td>
+      <td><b>${fmtInt(it.qty)}</b></td></tr>`).join('')
+      : `<tr><td colspan="8" style="color:#8a5b12">Sin ítems con consumo para abastecer en este establecimiento.</td></tr>`;
+    const warn = e.unreachable
+      ? `<div class="plan-warn">Con ítems abastecibles solo se alcanza ${fmt(e.proj,1)}% (faltan ${e.short} ítems para la meta${e.noCpa ? '; ' + e.noCpa + ' sin CPA' : ''}).</div>` : '';
+    return `<div class="plan-eess">
+      <div class="plan-eess-head">
+        <div><b>${e.est}</b><span>${e.red}${e.cod ? ' · ' + e.cod : ''}</span></div>
+        <div class="plan-prog"><span style="color:${textColorForDisp(e.cur)}">${fmt(e.cur,1)}%</span> → <span style="color:${textColorForDisp(e.proj)}">${fmt(e.proj,1)}%</span></div>
+        <div class="plan-count">${e.items.length} ítems</div>
+      </div>
+      ${warn}
+      <div class="table-scroll"><table>
+        <thead><tr><th>#</th><th>Cód.</th><th>Medicamento</th><th>Clasificación</th><th>Stock actual</th><th>CPA</th><th>Meses disp.</th><th>Cantidad a distribuir</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+    </div>`;
+  }).join('');
+  document.getElementById('planEessList').innerHTML = eessHtml ||
+    `<div class="alert ok"><div class="alert-ico">✅</div><div><b>Ningún establecimiento por debajo de la meta</b><span>Con los filtros actuales no hay nada que abastecer.</span></div></div>`;
+  document.getElementById('planEessCount').textContent = `${PLAN.eess.length} establecimientos · ${fmtInt(PLAN.itemsTotal)} ítems`;
+
+  // ----- Por producto -----
+  const prodHtml = PLAN.prods.map(p => {
+    const head = `<tr class="plan-prod-head"><td colspan="3"><b>${p.med}</b> <span class="muted">${p.codmed || ''}</span></td><td colspan="2"><b>${fmtInt(p.units)} u.</b> en total · ${p.list.length} EESS</td></tr>`;
+    const kids = p.list.map(x => `
+      <tr><td></td><td>${x.est}</td><td>${x.red}</td>
+      <td><span class="chip ${CHIP_CLS[x.ind]}"><span class="dot"></span>${IND_LABELS[x.ind]}</span></td>
+      <td><b>${fmtInt(x.qty)}</b></td></tr>`).join('');
+    return head + kids;
+  }).join('');
+  document.getElementById('tablePlanProd').innerHTML =
+    `<thead><tr><th></th><th>Establecimiento</th><th>Red</th><th>Clasificación</th><th>Cantidad a distribuir</th></tr></thead><tbody>${prodHtml || '<tr><td colspan="5">Sin productos por distribuir.</td></tr>'}</tbody>`;
+  document.getElementById('planProdCount').textContent = `${PLAN.prods.length} productos · ${fmtInt(PLAN.itemsTotal)} entregas`;
+}
+
+/* ---------- Exportar a Excel ---------- */
+function exportPlanXlsx(){
+  if (!PLAN) return;
+  const wb = XLSX.utils.book_new();
+  const flat = [];
+  PLAN.eess.forEach(e => e.items.forEach(it => flat.push({
+    'Red': e.red, 'Establecimiento': e.est,
+    'Disp. actual %': +e.cur.toFixed(1), 'Disp. proyectada %': +e.proj.toFixed(1),
+    'Código': it.codmed, 'Medicamento': it.med, 'Clasificación': IND_LABELS[it.ind],
+    'Stock actual': it.stk, 'CPA': it.cpa, 'Meses disp.': it.disp, 'Cantidad a distribuir': it.qty
+  })));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(flat), 'Por establecimiento');
+  const prodRows = PLAN.prods.map(p => ({ 'Código': p.codmed, 'Medicamento': p.med, 'EESS a abastecer': p.list.length, 'Cantidad total': p.units }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(prodRows), 'Por producto');
+  const resRows = PLAN.eess.map(e => ({ 'Red': e.red, 'Establecimiento': e.est, 'Disp. actual %': +e.cur.toFixed(1), 'Disp. proyectada %': +e.proj.toFixed(1), 'Ítems a abastecer': e.items.length, 'Alcanza la meta': e.unreachable ? 'No' : 'Sí' }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(resRows), 'Resumen EESS');
+  const f = new Date().toISOString().slice(0, 10);
+  XLSX.writeFile(wb, `plan_abastecimiento_${PLAN_STATE.target}pct_${f}.xlsx`);
+}
+
+/* ---------- Imprimir ---------- */
+function printPlan(){
+  document.body.classList.add('print-' + PLAN_STATE.tab);
+  window.print();
+}
+
+/* ---------- Eventos ---------- */
+function setPlanTab(tab){
+  PLAN_STATE.tab = tab;
+  document.querySelectorAll('#planTabs button[data-ptab]').forEach(b => b.classList.toggle('active', b.dataset.ptab === tab));
+  document.getElementById('planPaneEess').style.display = tab === 'eess' ? '' : 'none';
+  document.getElementById('planPaneProd').style.display = tab === 'prod' ? '' : 'none';
+}
+function bindPlan(){
+  const num = (id, key, min, max) => document.getElementById(id).addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    if (isNaN(v)) return;
+    PLAN_STATE[key] = Math.min(max, Math.max(min, v));
+    renderPlan();
+  });
+  num('planTarget', 'target', 50, 100);
+  num('planMonths', 'months', 2, 6);
+  [['planRed', 'red'], ['planPrio', 'prio'], ['planScope', 'scope']].forEach(([id, key]) =>
+    document.getElementById(id).addEventListener('change', e => { PLAN_STATE[key] = e.target.value; renderPlan(); }));
+  document.querySelectorAll('#planTabs button[data-ptab]').forEach(b => b.addEventListener('click', () => setPlanTab(b.dataset.ptab)));
+  document.getElementById('planBtnPrint').addEventListener('click', printPlan);
+  document.getElementById('planBtnXlsx').addEventListener('click', exportPlanXlsx);
+  window.addEventListener('afterprint', () => document.body.classList.remove('print-eess', 'print-prod'));
+}
+
+function populatePlanFilters(){
+  const sel = document.getElementById('planRed');
+  const reds = [...new Set(EST.map(e=>e.red))].sort();
+  sel.innerHTML = '<option value="">Todas las redes</option>' + reds.map(r=>`<option value="${r}">${r}</option>`).join('');
+  sel.value = PLAN_STATE.red;
+}
+
 loadAndRender();

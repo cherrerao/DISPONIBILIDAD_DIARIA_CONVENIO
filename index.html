@@ -35,6 +35,10 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
       Ranking &amp; Alertas
     </div>
+    <div class="nav-item" data-view="plan">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7h13v10H3zM16 10h3l2 3v4h-5M7 20a1.5 1.5 0 1 0 0-.01M18 20a1.5 1.5 0 1 0 0-.01"/></svg>
+      Plan de abastecimiento <span class="nav-badge" id="navRiskBadge" style="display:none"></span>
+    </div>
     <div class="nav-item" data-view="producto">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.5 7.3 12 12l-8.5-4.7M12 12v9M3.5 7.3v9.4L12 21l8.5-4.3V7.3L12 3Z"/></svg>
       Por Producto
@@ -76,6 +80,7 @@
     <!-- ============ RESUMEN ============ -->
     <div class="view active" id="view-resumen">
       <div id="alertBox"></div>
+      <div id="riskBox"></div>
       <div class="kpi-row" id="kpiRow"></div>
       <div class="grid2">
         <div class="card">
@@ -184,6 +189,50 @@
         </div>
         <div class="table-scroll">
           <table id="tableProd"><thead></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ PLAN DE ABASTECIMIENTO ============ -->
+    <div class="view" id="view-plan">
+      <div class="card no-print" style="margin-bottom:16px;">
+        <h3>Parámetros del plan</h3>
+        <div class="desc">Define la disponibilidad que quieres alcanzar y el plan se recalcula al instante</div>
+        <div class="plan-controls">
+          <label>Meta de disponibilidad (%)<input type="number" id="planTarget" value="95" min="50" max="100" step="1"></label>
+          <label>Cobertura objetivo (meses)<input type="number" id="planMonths" value="3" min="2" max="6" step="1"></label>
+          <label>Red<select id="planRed"><option value="">Todas las redes</option></select></label>
+          <label>Alcance<select id="planScope">
+            <option value="below">Todos los EESS bajo la meta</option>
+            <option value="crit">Solo críticos (≤80%)</option>
+          </select></label>
+          <label>Prioridad de ítems<select id="planPrio">
+            <option value="desab">Primero desabastecidos</option>
+            <option value="menor">Menor cantidad primero</option>
+          </select></label>
+        </div>
+      </div>
+      <div class="grid4 no-print" id="planKpis"></div>
+      <div id="planNotes"></div>
+      <div class="card">
+        <div class="plan-toolbar no-print">
+          <div class="plan-tabs" id="planTabs">
+            <button class="active" data-ptab="eess">Por establecimiento</button>
+            <button data-ptab="prod">Por producto</button>
+          </div>
+          <div class="plan-actions">
+            <button class="btn" id="planBtnXlsx">⬇ Excel</button>
+            <button class="btn primary" id="planBtnPrint">🖨 Imprimir</button>
+          </div>
+        </div>
+        <div id="planPrintHead" class="plan-print-head"></div>
+        <div id="planPaneEess">
+          <div class="count-pill-row no-print"><span class="count-pill" id="planEessCount"></span></div>
+          <div id="planEessList"></div>
+        </div>
+        <div id="planPaneProd" style="display:none">
+          <div class="count-pill-row no-print"><span class="count-pill" id="planProdCount"></span></div>
+          <div class="table-scroll"><table id="tablePlanProd"></table></div>
         </div>
       </div>
     </div>
